@@ -126,7 +126,7 @@ def preprocess_for_train(image,
         return image, 
 
 
-def preprocess_for_eval(image, labels, bboxes,
+def preprocess_for_eval(image,
                         out_shape=EVAL_SIZE, data_format='NHWC',
                         difficults=None, resize=Resize.WARP_RESIZE,
                         scope='ssd_preprocessing_train'):
