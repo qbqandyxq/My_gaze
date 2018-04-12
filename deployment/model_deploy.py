@@ -112,11 +112,8 @@ def optimize_clones(clones, optimizer,
             if clone_loss is not None:
                 clones_losses.append(clone_loss)
                 grads_and_vars.append(clone_grad)
-      # Only use regularization_losses for the first clone
             regularization_losses = None
-  # Compute the total_loss summing all the clones_losses.
     total_loss = tf.add_n(clones_losses, name='total_loss')
-  # Sum the gradients across clones.
     grads_and_vars = _sum_clones_gradients(grads_and_vars)
     return total_loss, grads_and_vars
 

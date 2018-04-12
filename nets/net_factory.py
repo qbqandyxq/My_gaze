@@ -17,7 +17,14 @@ networks_map = {'gazebase': gazebase.alexnet_v2,
 
 arg_scopes_map = {'gazebase': gazebase.alexnet_v2_arg_scope,
                  }
+networks_obj = {'gazebase': gazebase.GazeNet,
+                }
 
+def get_network(name):
+    """Get a network object from a name.
+    """
+    # params = networks_obj[name].default_params if params is None else params
+    return networks_obj[name]
 
 def get_network_fn(name, weight_decay=0.0, is_training=False):
     if name not in networks_map:

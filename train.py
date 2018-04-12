@@ -21,10 +21,13 @@ from datasets import dataset_factory
 from nets import net_factory
 from preprocessing import preprocessing_factory
 import tf_utils
+import os
 
+os.environ["CUDA_DEVICE_ORDER"]="PCI_BUS_ID"
+os.environ["CUDA_VISIBLE_DEVICES"]="4"
 slim = tf.contrib.slim
 
-DATA_FORMAT = 'NCHW'
+DATA_FORMAT = 'NHWC'
 
 # =========================================================================== #
 # ge Network flags.
@@ -106,7 +109,7 @@ tf.app.flags.DEFINE_string(
     'exponential',
     'Specifies how the learning rate is decayed. One of "fixed", "exponential",'
     ' or "polynomial"')
-tf.app.flags.DEFINE_float('learning_rate', 0.001, 'Initial learning rate.')
+tf.app.flags.DEFINE_float('learning_rate', 0.0001, 'Initial learning rate.')
 tf.app.flags.DEFINE_float(
     'end_learning_rate', None,
     'The minimal end learning rate used by a polynomial decay learning rate.')
@@ -203,10 +206,17 @@ def main(_):
         ######################
         # Select the network #
         ######################
+        network_fn = net_factory.get_network(FLAGS.model_name)
+        
+        gaze_params = network_fn.default_params._replace(labels=6)
+        gaze_net = network_fn(gaze_params)
+        gaze_shape = gaze_net.params.img_shape
+        '''
         network_fn = net_factory.get_network_fn(
         FLAGS.model_name,
         weight_decay=FLAGS.weight_decay,
         is_training=True)
+        '''
 
         #####################################
         # Select the preprocessing function #
@@ -232,133 +242,134 @@ def main(_):
             labels_ = tf.stack(labels_)
             train_image_size = FLAGS.train_image_size or network_fn.default_image_size
             # resize operation in here
-            image = image_preprocessing_fn(image, train_image_size)
+            image = image_preprocessing_fn(image, train_image_size)[0]
+            
             images, labels = tf.train.batch(
+                #input_queue,
                 [image, labels_],
                 batch_size=FLAGS.batch_size,
                 num_threads=FLAGS.num_preprocessing_threads,
                 capacity=5 * FLAGS.batch_size)
-            
             batch_queue = slim.prefetch_queue.prefetch_queue(
                 [images, labels], capacity=2 * deploy_config.num_clones)
-        
-        
         
         # =================================================================== #
         # Define the model running on every GPU.
         # =================================================================== #
         def clone_fn(batch_queue):
             images, labels = batch_queue.dequeue()
-            logits, end_points = network_fn(images)
-            loss = tf.abs((logits - labels))
-            cost = tf.reduce_mean(loss)
-            
-            return end_points
+
+            # Construct SSD network.
+            arg_scope = gaze_net.arg_scope(weight_decay=FLAGS.weight_decay,
+                                          data_format=DATA_FORMAT)
+            with slim.arg_scope(arg_scope):
+                logits = gaze_net.net(images, is_training=True)#, end_points
+            # Add loss function.
+            loss_total = gaze_net.losses(logits, labels)
+
+            return loss_total
         
 
     # Gather initial summaries.
-    summaries = set(tf.get_collection(tf.GraphKeys.SUMMARIES))
-    print("hello")
-    clones = model_deploy.create_clones(deploy_config, clone_fn, [batch_queue])
-    print("ok4")
-    first_clone_scope = deploy_config.clone_scope(0)
-    print("ok5")
-    # Gather update_ops from the first clone. These contain, for example,
-    # the updates for the batch_norm variables created by network_fn.
-    update_ops = tf.get_collection(tf.GraphKeys.UPDATE_OPS, first_clone_scope)
+        summaries = set(tf.get_collection(tf.GraphKeys.SUMMARIES))
+        clones = model_deploy.create_clones(deploy_config, clone_fn, [batch_queue])
 
+        first_clone_scope = deploy_config.clone_scope(0)
+        
+        update_ops = tf.get_collection(tf.GraphKeys.UPDATE_OPS, first_clone_scope)
+        
     # Add summaries for end_points.
-    end_points = clones[0].outputs
-    for end_point in end_points:
-        x = end_points[end_point]
-        summaries.add(tf.summary.histogram('activations/' + end_point, x))
-        summaries.add(tf.summary.scalar('sparsity/' + end_point,
-                                      tf.nn.zero_fraction(x)))
+        end_points = clones[0].outputs
 
-    # Add summaries for losses.
-    for loss in tf.get_collection(tf.GraphKeys.LOSSES, first_clone_scope):
-        summaries.add(tf.summary.scalar('losses/%s' % loss.op.name, loss))
+# Add summaries for losses and extra losses.
+        for loss in tf.get_collection(tf.GraphKeys.LOSSES, first_clone_scope):
+            summaries.add(tf.summary.scalar(loss.op.name, loss))
+        for loss in tf.get_collection('EXTRA_LOSSES', first_clone_scope):
+            summaries.add(tf.summary.scalar(loss.op.name, loss))
 
-    # Add summaries for variables.
-    for variable in slim.get_model_variables():
-        summaries.add(tf.summary.histogram(variable.op.name, variable))
+        # Add summaries for variables.
+        for variable in slim.get_model_variables():
+            summaries.add(tf.summary.histogram(variable.op.name, variable))
 
-    #################################
-    # Configure the moving averages #
-    #################################
-    if FLAGS.moving_average_decay:
-        moving_average_variables = slim.get_model_variables()
-        variable_averages = tf.train.ExponentialMovingAverage(
-            FLAGS.moving_average_decay, global_step)
-    else:
-        moving_average_variables, variable_averages = None, None
+        # =================================================================== #
+        # Configure the moving averages.
+        # =================================================================== #
 
-    #########################################
-    # Configure the optimization procedure. #
-    #########################################
-    with tf.device(deploy_config.optimizer_device()):
-        learning_rate = _configure_learning_rate(dataset.num_samples, global_step)
-        optimizer = _configure_optimizer(learning_rate)
-        summaries.add(tf.summary.scalar('learning_rate', learning_rate))
+        if FLAGS.moving_average_decay:
+            moving_average_variables = slim.get_model_variables()
+            variable_averages = tf.train.ExponentialMovingAverage(
+                FLAGS.moving_average_decay, global_step)
+        else:
+            moving_average_variables, variable_averages = None, None
 
-    if FLAGS.sync_replicas:
-      # If sync_replicas is enabled, the averaging will be done in the chief
-      # queue runner.
-        optimizer = tf.train.SyncReplicasOptimizer(
-            opt=optimizer,
-            replicas_to_aggregate=FLAGS.replicas_to_aggregate,
-            total_num_replicas=FLAGS.worker_replicas,
-            variable_averages=variable_averages,
-            variables_to_average=moving_average_variables)
-    elif FLAGS.moving_average_decay:
-      # Update ops executed locally by trainer.
-      update_ops.append(variable_averages.apply(moving_average_variables))
+        # =================================================================== #
+        # Configure the optimization procedure.
+        # =================================================================== #
+        with tf.device(deploy_config.optimizer_device()):
+            learning_rate = tf_utils.configure_learning_rate(FLAGS,
+                                                             dataset.num_samples,
+                                                             global_step)
+            optimizer = tf_utils.configure_optimizer(FLAGS, learning_rate)
+            summaries.add(tf.summary.scalar('learning_rate', learning_rate))
 
-    # Variables to train.
-    variables_to_train = _get_variables_to_train()
+        if FLAGS.moving_average_decay:
+            # Update ops executed locally by trainer.
+            update_ops.append(variable_averages.apply(moving_average_variables))
 
-    #  and returns a train_tensor and summary_op
-    total_loss, clones_gradients = model_deploy.optimize_clones(
-        clones,
-        optimizer,
-        var_list=variables_to_train)
-    # Add total_loss to summary.
-    summaries.add(tf.summary.scalar('total_loss', total_loss))
+        # Variables to train.
+        variables_to_train = tf_utils.get_variables_to_train(FLAGS)
 
-    # Create gradient updates.
-    grad_updates = optimizer.apply_gradients(clones_gradients,
-                                             global_step=global_step)
-    update_ops.append(grad_updates)
+        # and returns a train_tensor and summary_op
+        total_loss, clones_gradients = model_deploy.optimize_clones(
+            clones,
+            optimizer,
+            var_list=variables_to_train)
+        # Add total_loss to summary.
+        summaries.add(tf.summary.scalar('total_loss', total_loss))
+        
 
-    update_op = tf.group(*update_ops)
-    with tf.control_dependencies([update_op]):
-        train_tensor = tf.identity(total_loss, name='train_op')
+        # Create gradient updates.
+        grad_updates = optimizer.apply_gradients(clones_gradients,
+                                                 global_step=global_step)
+        update_ops.append(grad_updates)
+        update_op = tf.group(*update_ops)
+        train_tensor = control_flow_ops.with_dependencies([update_op], total_loss,
+                                                          name='train_op')
 
-    # Add the summaries from the first clone. These contain the summaries
-    # created by model_fn and either optimize_clones() or _gather_clone_loss().
-    summaries |= set(tf.get_collection(tf.GraphKeys.SUMMARIES,
-                                       first_clone_scope))
+        # Add the summaries from the first clone. These contain the summaries
+        summaries |= set(tf.get_collection(tf.GraphKeys.SUMMARIES,
+                                           first_clone_scope))
+        # Merge all summaries together.
+        summary_op = tf.summary.merge(list(summaries), name='summary_op')
 
-    # Merge all summaries together.
-    summary_op = tf.summary.merge(list(summaries), name='summary_op')
+        # =================================================================== #
+        # Kicks off the training.
+        # =================================================================== #
 
+        gpu_options = tf.GPUOptions(per_process_gpu_memory_fraction=FLAGS.gpu_memory_fraction)
+        config = tf.ConfigProto(log_device_placement=False,
+                                gpu_options=gpu_options)
+        saver = tf.train.Saver(max_to_keep=5,
+                               keep_checkpoint_every_n_hours=1.0,
+                               write_version=2,
+                               pad_step_number=False)
 
-    ###########################
-    # Kicks off the training. #
-    ###########################
-    slim.learning.train(
-        train_tensor,
-        logdir=FLAGS.train_dir,
-        master=FLAGS.master,
-        is_chief=(FLAGS.task == 0),
-        init_fn=_get_init_fn(),
-        summary_op=summary_op,
-        number_of_steps=FLAGS.max_number_of_steps,
-        log_every_n_steps=FLAGS.log_every_n_steps,
-        save_summaries_secs=FLAGS.save_summaries_secs,
-        save_interval_secs=FLAGS.save_interval_secs,
-        sync_optimizer=optimizer if FLAGS.sync_replicas else None)
+        slim.learning.train(
+            train_tensor,
+            logdir=FLAGS.train_dir,
+            master='',
+            is_chief=True,
+            init_fn=tf_utils.get_init_fn(FLAGS),
+            summary_op=summary_op,
+            number_of_steps=FLAGS.max_number_of_steps,
+            log_every_n_steps=FLAGS.log_every_n_steps,
+            save_summaries_secs=FLAGS.save_summaries_secs,
+            saver=saver,
+            save_interval_secs=FLAGS.save_interval_secs,
+            session_config=config,
+            sync_optimizer=None)
+
 
 
 if __name__ == '__main__':
-  tf.app.run()
+    tf.app.run()
